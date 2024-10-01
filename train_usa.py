@@ -25,7 +25,8 @@ def load_data(name):
     
     if name == "billsum":
         dataset = load_dataset("FiscalNote/billsum")
-        
+    elif name == "qmsum":
+        dataset = load_dataset("ioeddk/qmsum")
     else:
         raise NotImplementedError
     
@@ -48,7 +49,13 @@ def prompt_builder(model_name, data_name):
             {"role" : "user", "content" : 'Provide one line summary'}]
             return messages
         return builder
+    elif model_name == "llama3-inst" and data_name == "qmsum":
 
+        def builder (instance):
+            messages = [{"role": "user", "content": '{}'.format(instance['text'].split("Answer:")[0])},
+            {"role" : "assistant", "content": '{}'.format(instance['answer'])}]
+            return messages
+        return builder
     else:
         raise NotImplementedError
 
@@ -138,7 +145,7 @@ def train_usa(model, usas, train_data_loader, test_data_loader, target_mode, opt
             if max_train_itr > 0 and itr > max_train_itr:
                 break
             if batch_idx % 10 == 0:
-                result = evaluate_coverage(model, usas, test_data_loader)
+                result = evaluate_coverage(model, usas, test_data_loader, num_samples=10)
                 print('{}/{} coverage:{:.6f} sparsity:{:.6f}'.format(batch_idx, train_data_loader.__len__(), result['coverage'], result['sparsity']))
 
                 torch.save(usas.cpu().state_dict(), "./artifacts/usa.pt")
@@ -169,8 +176,6 @@ def train_usa(model, usas, train_data_loader, test_data_loader, target_mode, opt
 
 def data_pipeline(train_data, tokenizer, builder, max_len):
     chat_train_data = train_data.map(lambda instance: {'prompt' : tokenizer.apply_chat_template(builder(instance), tokenize=False, add_generation_prompt=True) })
-    import pdb
-    pdb.set_trace()
     encoded_train_data = chat_train_data.map(lambda instance: tokenizer(instance['prompt']))    
     def middle_truncate(instance, length=max_len):
         assert(len(instance['attention_mask']) >= length) #TODO(pad the smaller sequences)
@@ -188,7 +193,7 @@ def main():
     parser = argparse.ArgumentParser(description=" Train Script for USA")
 
     # Add arguments
-    parser.add_argument("--dataset", type=str, help="dataset", choices=["billsum"])
+    parser.add_argument("--dataset", type=str, help="dataset", choices=["billsum", "qmsum"])
     parser.add_argument("--model", type=str, help="model", choices=["llama3-inst"])
     parser.add_argument("--train_epochs", type=int, help="train args: epochs", default=1)
     parser.add_argument("--batch", type=int, help="train args: batchsize", default=1)
@@ -198,7 +203,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity")
 
     # usa 
-    parser.add_argument("--usa_load", type=str, help="load usa", default=None)
+    parser.add_argument("--usa-load", type=str, help="load usa", default=None)
     parser.add_argument("--usa-L", type=int, help="usa L", default=32)
     parser.add_argument("--usa-R", type=int, help="usa R", default=4)
     parser.add_argument("--usa-int-dim", type=int, help="usa int dim", default=256)
@@ -243,18 +248,18 @@ def main():
 
 
     ## USA loading
-    if args.usa_load is None:
-        usas = []
-        for i in range(len(model.model.layers)):
-            usas.append( USA( model.model.layers[0].self_attn.num_heads, 
-                            model.model.layers[i].self_attn.head_dim,
-                            usa_params = {'L': args.usa_L, 'R': args.usa_R, 'int_dim': args.usa_int_dim, 'aug_k' : 0},
-                            annealing_paramters = {'T': 10, 't': 0}
-                            )
+
+    usas = []
+    for i in range(len(model.model.layers)):
+        usas.append( USA( model.model.layers[0].self_attn.num_heads, 
+                        model.model.layers[i].self_attn.head_dim,
+                        usa_params = {'L': args.usa_L, 'R': args.usa_R, 'int_dim': args.usa_int_dim, 'aug_k' : 0},
+                        annealing_paramters = {'T': 10, 't': 0}
                         )
-        usas = torch.nn.ModuleList(usas).to("cuda:0")
-    else:
-        raise NotImplementedError
+                    )
+    usas = torch.nn.ModuleList(usas).to("cuda:0")
+    if args.usa_load is not None:
+        usas.load_state_dict(torch.load(args.usa_load))
     
     span_criterion = torch.nn.BCELoss() # Define your loss function (e.g., torch.nn.CrossEntropyLoss())
     optimizer = torch.optim.Adam(usas.parameters()) # Define your optimizer (e.g., torch.optim.Adam(model.parameters()))
