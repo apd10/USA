@@ -195,7 +195,7 @@ def train_step(usa, K, Q, target_mode, span_criterion, num_queries, recall_weigh
 
 def train_usa(model, usas, train_data_loader, test_data_loader, target_mode, optimizer, span_criterion, max_train_itr, num_queries, accumulate_grad, recall_weight,args):
     itr = 0
-    for epoch in range(1000):
+    for epoch in range(args.epochs):
         for (batch_idx, batch) in tqdm(enumerate(train_data_loader), total=train_data_loader.__len__()):
 
                 # if batch_idx == DEBUG_SAMPLES:
@@ -207,7 +207,7 @@ def train_usa(model, usas, train_data_loader, test_data_loader, target_mode, opt
                 if itr % 64 == 0:
                     result = evaluate_coverage(model, usas, train_data_loader, target_mode, num_queries=num_queries, num_samples=10)
                     print('TRAIN {}/{} recall:{:.6f} precision:{:.6f}'.format(batch_idx, train_data_loader.__len__(), result['recall'], result['precision']))
-                    result = evaluate_coverage(model, usas, test_data_loader, target_mode, num_queries=num_queries, num_samples=100)
+                    result = evaluate_coverage(model, usas, test_data_loader, target_mode, num_queries=num_queries, num_samples=10)
                     print('TEST {}/{} recall:{:.6f} precision:{:.6f}'.format(batch_idx, train_data_loader.__len__(), result['recall'], result['precision']))
 
                     torch.save(usas.cpu().state_dict(), "./artifacts/usa.pt")
@@ -234,22 +234,35 @@ def train_usa(model, usas, train_data_loader, test_data_loader, target_mode, opt
                 if itr % accumulate_grad == 0:
                     optimizer.step()
                     optimizer.zero_grad()
-                print(np.mean(losses), losses, flush=True)
+                print(batch['input_ids'].shape, np.mean(losses), flush=True)
                 itr += 1
 
 
-def data_pipeline(train_data, tokenizer, builder, max_len):
+def data_pipeline(train_data, tokenizer, builder, max_len, is_training):
     chat_train_data = train_data.map(lambda instance: {'prompt' : tokenizer.apply_chat_template(builder(instance), tokenize=False, add_generation_prompt=True) })
-    encoded_train_data = chat_train_data.map(lambda instance: tokenizer(instance['prompt']))    
-    def middle_truncate(instance, length=max_len):
-        assert(len(instance['attention_mask']) >= length) #TODO(pad the smaller sequences)
+    encoded_train_data = chat_train_data.map(lambda instance: tokenizer(instance['prompt']))
+    encoded_train_data = encoded_train_data.filter(lambda instance: len(instance['attention_mask']) >= max_len)
+    nums = {}
+    powers = [256,512,768,1024]
+            
+    def middle_truncate(instance):
+        if is_training:
+            length = powers[len(instance['attention_mask']) % 4]
+        else:
+            length = max_len
+        if length in nums.keys():
+            nums[length] += 1
+        else:
+            nums[length] = 1
         mid_point = len(instance['attention_mask']) // 2
         excess = len(instance['attention_mask']) - length
         left = mid_point - excess // 2
         return {'input_ids' : instance['input_ids'][:left] + instance['input_ids'][left + excess:],
                 'attention_mask' : instance['attention_mask'][:left] + instance['attention_mask'][left + excess:],
                 }
+
     truncated_encoded_train_data = encoded_train_data.map(middle_truncate)
+    print("length stats", nums)
     truncated_encoded_train_data.set_format(type='torch', columns=['input_ids', 'attention_mask'])
     return truncated_encoded_train_data
     
@@ -278,6 +291,8 @@ def main():
     parser.add_argument("--num-queries", type=int, help="num queries for training and testing", default=8)
     parser.add_argument("--recall-weight", type=float, help="num queries for training and testing", default=10.0)
     parser.add_argument("--skip-examples", type=int, help="skip examples", default=0)
+    parser.add_argument("--is-training", action="store_true", help="is training")
+    parser.add_argument("--epochs", type=int, default=2)
 
 
     args = parser.parse_args()
@@ -297,8 +312,8 @@ def main():
     train_data = dataset['train']
     test_data = dataset['test']
 
-    truncated_encoded_train_data = data_pipeline(train_data, tokenizer, builder, args.max_length)
-    truncated_encoded_test_data = data_pipeline(test_data, tokenizer, builder, args.max_length)
+    truncated_encoded_train_data = data_pipeline(train_data, tokenizer, builder, args.max_length, args.is_training)
+    truncated_encoded_test_data = data_pipeline(test_data, tokenizer, builder, args.max_length, args.is_training)
 
     # chat_train_data = train_data.map(lambda instance: {'prompt' : tokenizer.apply_chat_template(builder(instance), tokenize=False, add_generation_prompt=True) })
     # encoded_train_data = chat_train_data.map(lambda instance: tokenizer(instance['prompt']))    
@@ -334,8 +349,13 @@ def main():
     span_criterion = torch.nn.BCELoss() # Define your loss function (e.g., torch.nn.CrossEntropyLoss())
     optimizer = torch.optim.Adam(usas.parameters()) # Define your optimizer (e.g., torch.optim.Adam(model.parameters()))
     print(model)
-    train_usa(model, usas, train_data_loader, test_data_loader, args.usa_target_mode, optimizer, loss_function, args.max_train_itr, args.num_queries, args.accumulate_grad, args.recall_weight, args)
-    torch.save(usas.cpu().state_dict(), "./artifacts/usa-" + args.model + "-config-" + 'L_{}-R_{}-I_{}-mode-{}'.format(args.usa_L, args.usa_R, args.usa_int_dim, args.usa_target_mode))
+    if args.is_training:
+        train_usa(model, usas, train_data_loader, test_data_loader, args.usa_target_mode, optimizer, loss_function, args.max_train_itr, args.num_queries, args.accumulate_grad, args.recall_weight, args)
+        #torch.save(usas.cpu().state_dict(), "./artifacts/usa-" + args.model + "-config-" + 'L_{}-R_{}-I_{}-mode-{}'.format(args.usa_L, args.usa_R, args.usa_int_dim, args.usa_target_mode))
+    else:
+        assert(args.usa_load is not None)
+        result = evaluate_coverage(model, usas, test_data_loader, args.usa_target_mode, args.num_queries, num_samples=64)
+        print('TEST recall:{:.6f} precision:{:.6f}'.format(result['recall'], result['precision']))
 
 if __name__ == '__main__':
     main()
